@@ -11,6 +11,7 @@ from collections import deque
 
 import idc
 import idaapi
+from ida_hexrays import *
 from PyQt5 import QtGui, QtCore
 
 import capa.rules
@@ -39,6 +40,24 @@ from capa.features.address import Address, AbsoluteVirtualAddress
 # default highlight color used in IDA window
 DEFAULT_HIGHLIGHT = 0xE6C700
 
+class asg_parent_finder_t(ctree_visitor_t):
+
+    def __init__(self, call_ea):
+
+        ctree_visitor_t.__init__(self, CV_PARENTS)
+        self.call_ea = call_ea
+        self.asg_ea = idaapi.BADADDR
+
+    def visit_expr(self, expr):
+
+        if expr.op == cot_asg and \
+            ((expr.y.op == cot_call and expr.y.ea == self.call_ea) or \
+             (expr.y.op == cot_cast and expr.y.x.op == cot_call and expr.y.x.ea == self.call_ea)):
+            self.asg_ea = expr.ea
+            print(f'{self.call_ea:#x}: assignment detected, replaced with the ea {self.asg_ea:#x}')
+            return 1
+
+        return 0
 
 class CapaExplorerDataModel(QtCore.QAbstractItemModel):
     """model for displaying hierarchical results return by capa"""
@@ -504,14 +523,80 @@ class CapaExplorerDataModel(QtCore.QAbstractItemModel):
                     parent2 = parent
                 elif capa.rules.Scope.FUNCTION in rule.meta.scopes:
                     parent2 = CapaExplorerFunctionItem(parent, location)
+                    self.insert_rpt_comm(rule_name, int(location), rule.meta.scopes)
                 elif capa.rules.Scope.BASIC_BLOCK in rule.meta.scopes:
                     parent2 = CapaExplorerBlockItem(parent, location)
+                    self.insert_rpt_comm(rule_name, int(location), rule.meta.scopes)
                 elif capa.rules.Scope.INSTRUCTION in rule.meta.scopes:
                     parent2 = CapaExplorerInstructionItem(parent, location)
+                    self.insert_rpt_comm(rule_name, int(location), rule.meta.scopes)
                 else:
                     raise RuntimeError("unexpected rule scope: " + str(rule.meta.scopes.static))
 
                 self.render_capa_doc_match(parent2, match, doc)
+
+    def get_ctree_root(self, ea, cache=True):
+
+        cfunc = None
+        try:
+            if cache:
+                cfunc = idaapi.decompile(ea)
+            else:
+                cfunc = idaapi.decompile(ea, flags=DECOMP_NO_CACHE)
+        except:
+            print('Decompilation of a function {:#x} failed'.format(ea))
+
+        return cfunc
+
+    def set_decomplier_cmt(self, ea, cmt):
+
+        cfunc = self.get_ctree_root(ea)
+
+        if cfunc:
+            # Prevent orphan comment issues in assignments
+            finder = asg_parent_finder_t(ea)
+            finder.apply_to_exprs(cfunc.body, None)
+            cmt_ea = ea if finder.asg_ea == idaapi.BADADDR else finder.asg_ea
+
+            tl = idaapi.treeloc_t()
+            tl.ea = cmt_ea
+            tl.itp = idaapi.ITP_SEMI
+            '''
+            # The code didn't work :-(
+            for itp in range (idaapi.ITP_BRACE1, idaapi.ITP_BLOCK2):
+                tl.itp = itp
+                cfunc.set_user_cmt(tl, cmt)
+                cfunc.save_user_cmts()
+                unused = cfunc.__str__()
+                if not cfunc.has_orphan_cmts():
+                    cfunc.save_user_cmts()
+                    break
+                cfunc.del_orphan_cmts()
+            '''
+            cfunc.set_user_cmt(tl, cmt)
+            cfunc.save_user_cmts()
+            cfunc.refresh_func_ctext()
+
+    def insert_rpt_comm(self, rule_name, location, scopes):
+        import ida_lines
+
+        if capa.rules.Scope.FUNCTION in scopes:
+            old = idc.get_func_cmt(location, 1)
+            new = 'CAPA (function): {}'.format(rule_name)
+            if new not in old:
+                cmt = old + '\n' + new
+                idc.set_func_cmt(location, cmt, 1)
+        elif capa.rules.Scope.BASIC_BLOCK in scopes:
+            cmt = 'CAPA (basic block): {}'.format(rule_name)
+            ida_lines.add_extra_cmt(location, 1, cmt)
+            self.set_decomplier_cmt(location, cmt)
+        elif capa.rules.Scope.INSTRUCTION in scopes:
+            old = idc.get_cmt(location, 1)
+            new = 'CAPA (instruction): {}'.format(rule_name)
+            if new not in old:
+                cmt = old + '\n' + new
+                idc.set_cmt(location, cmt, 1)
+                self.set_decomplier_cmt(location, cmt)
 
     def render_capa_doc(self, doc: rd.ResultDocument, by_function: bool):
         """render capa features specified in doc
